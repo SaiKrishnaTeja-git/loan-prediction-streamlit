@@ -1,6 +1,7 @@
 streamlit
 pandas
+numpy
 scikit-learn
 xgboost
 joblib
-requests
+xlrd>=2.0.1
