@@ -626,11 +626,10 @@ st.markdown(
     """
     <div class="hero">
         <h1>🏦 Loan Approval Predictor</h1>
-
         <p>
-            Credit Assessment •
-            Machine Learning Insights •
-            AI-Powered Applicant Guidance
+            Machine Learning  •
+            Credit Risk Analytics  •
+            AI-Powered Financial Insights
         </p>
     </div>
     """,
