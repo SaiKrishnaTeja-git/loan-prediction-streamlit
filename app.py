@@ -16,13 +16,15 @@ from xgboost import XGBClassifier
 
 
 # ============================================================
-# OPTIONAL GROQ IMPORT
+# GROQ IMPORT
 # ============================================================
 
 try:
     from groq import Groq
+    GROQ_PACKAGE_AVAILABLE = True
 except ImportError:
     Groq = None
+    GROQ_PACKAGE_AVAILABLE = False
 
 
 # ============================================================
@@ -108,13 +110,6 @@ DATA_FILE = BASE_DIR / "07_loan_train.xls"
 # MODEL FEATURES
 # ============================================================
 
-# Customer-facing reduced feature set.
-#
-# IMPORTANT:
-# This is a portfolio/demo model.
-# It should be retrained and validated on this exact
-# feature set before any real-world deployment.
-
 NUMERIC = [
     "ApplicantIncome",
     "CoapplicantIncome",
@@ -136,43 +131,67 @@ FEATURES = NUMERIC + CATEGORICAL
 # GROQ CONFIGURATION
 # ============================================================
 
-# IMPORTANT:
-# We deliberately hard-code the current model here so an old
-# GROQ_MODEL environment variable cannot override it.
-#
-# Do NOT put your API key in this file.
-
 GROQ_MODEL = "openai/gpt-oss-120b"
 
 
 def get_groq_client():
     """
-    Create a Groq client without exposing the API key
-    in source code.
+    Create Groq client.
+
+    Priority:
+    1. Streamlit Cloud Secrets
+    2. Local environment variable
+
+    API key is never stored in this Python file.
     """
 
-    if Groq is None:
+    # --------------------------------------------------------
+    # Check Groq package
+    # --------------------------------------------------------
+
+    if not GROQ_PACKAGE_AVAILABLE:
         return None
 
+    api_key = None
+
     # --------------------------------------------------------
-    # Streamlit Cloud / deployed application
+    # Streamlit Cloud Secrets
     # --------------------------------------------------------
 
     try:
-        api_key = st.secrets.get("GROQ_API_KEY")
+        api_key = st.secrets["GROQ_API_KEY"]
     except Exception:
         api_key = None
 
     # --------------------------------------------------------
-    # Local development
+    # Local environment variable
     # --------------------------------------------------------
 
-    api_key = api_key or st.secrets.get("GROQ_API_KEY")
+    if not api_key:
+        api_key = os.getenv("GROQ_API_KEY")
+
+    # --------------------------------------------------------
+    # Validate key
+    # --------------------------------------------------------
 
     if not api_key:
         return None
 
-    return Groq(api_key=api_key)
+    api_key = str(api_key).strip()
+
+    if not api_key:
+        return None
+
+    # --------------------------------------------------------
+    # Create client
+    # --------------------------------------------------------
+
+    try:
+        client = Groq(api_key=api_key)
+        return client
+
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -183,13 +202,40 @@ def get_groq_client():
 def train_demo_model():
 
     # --------------------------------------------------------
-    # Read dataset
+    # Check dataset
+    # --------------------------------------------------------
+
+    if not DATA_FILE.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {DATA_FILE}"
+        )
+
+    # --------------------------------------------------------
+    # Read Excel dataset
     # --------------------------------------------------------
 
     df = pd.read_excel(DATA_FILE)
 
     # --------------------------------------------------------
-    # Select features
+    # Check required columns
+    # --------------------------------------------------------
+
+    required_columns = FEATURES + ["Loan_Status"]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "The following required columns are missing from "
+            f"the dataset: {missing_columns}"
+        )
+
+    # --------------------------------------------------------
+    # Features
     # --------------------------------------------------------
 
     X = df[FEATURES].copy()
@@ -207,10 +253,12 @@ def train_demo_model():
     X["Dependents"] = (
         X["Dependents"]
         .astype(str)
-        .replace({
-            "nan": np.nan,
-            "None": np.nan
-        })
+        .replace(
+            {
+                "nan": np.nan,
+                "None": np.nan
+            }
+        )
     )
 
     # --------------------------------------------------------
@@ -218,22 +266,22 @@ def train_demo_model():
     # --------------------------------------------------------
 
     preprocessor = ColumnTransformer(
-        [
+        transformers=[
             (
                 "num",
                 SimpleImputer(strategy="median"),
                 NUMERIC
             ),
-
             (
                 "cat",
                 Pipeline(
-                    [
+                    steps=[
                         (
                             "imputer",
-                            SimpleImputer(strategy="most_frequent")
+                            SimpleImputer(
+                                strategy="most_frequent"
+                            )
                         ),
-
                         (
                             "onehot",
                             OneHotEncoder(
@@ -248,7 +296,7 @@ def train_demo_model():
     )
 
     # --------------------------------------------------------
-    # XGBoost Model
+    # XGBoost
     # --------------------------------------------------------
 
     model = XGBClassifier(
@@ -263,18 +311,18 @@ def train_demo_model():
     )
 
     # --------------------------------------------------------
-    # Complete Pipeline
+    # Complete pipeline
     # --------------------------------------------------------
 
     pipe = Pipeline(
-        [
+        steps=[
             ("preprocessor", preprocessor),
             ("model", model)
         ]
     )
 
     # --------------------------------------------------------
-    # Train / Test Split
+    # Train / Test split
     # --------------------------------------------------------
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -297,15 +345,21 @@ def train_demo_model():
 
     pred = pipe.predict(X_test)
 
-    prob = pipe.predict_proba(X_test)[:, 1]
+    probability = pipe.predict_proba(X_test)[:, 1]
 
     # --------------------------------------------------------
     # Metrics
     # --------------------------------------------------------
 
-    accuracy = accuracy_score(y_test, pred)
+    accuracy = accuracy_score(
+        y_test,
+        pred
+    )
 
-    auc = roc_auc_score(y_test, prob)
+    auc = roc_auc_score(
+        y_test,
+        probability
+    )
 
     return pipe, accuracy, auc
 
@@ -314,13 +368,11 @@ def train_demo_model():
 # AI PROMPT
 # ============================================================
 
-def build_ai_prompt(application, probability, prediction):
-    """
-    Build a grounded prompt.
-
-    The LLM explains the model output.
-    It does NOT make the credit decision.
-    """
+def build_ai_prompt(
+    application,
+    probability,
+    prediction
+):
 
     outcome = (
         "indicative approved"
@@ -358,15 +410,32 @@ NOT a guaranteed approval probability.
 
 APPLICATION DATA:
 
-- Monthly applicant income: ₹{application['monthly_income']:,.0f}
-- Monthly co-applicant income: ₹{application['monthly_coapp_income']:,.0f}
-- Combined monthly income: ₹{application['total_monthly']:,.0f}
-- Requested loan amount: ₹{application['requested_loan']:,.0f}
-- Preferred repayment term: {application['term']} months
-- Dependents: {application['dependents']}
-- Education: {application['education']}
-- Employment: {application['employment']}
-- Property area: {application['property_area']}
+- Monthly applicant income:
+  ₹{application['monthly_income']:,.0f}
+
+- Monthly co-applicant income:
+  ₹{application['monthly_coapp_income']:,.0f}
+
+- Combined monthly income:
+  ₹{application['total_monthly']:,.0f}
+
+- Requested loan amount:
+  ₹{application['requested_loan']:,.0f}
+
+- Preferred repayment term:
+  {application['term']} months
+
+- Dependents:
+  {application['dependents']}
+
+- Education:
+  {application['education']}
+
+- Employment:
+  {application['employment']}
+
+- Property area:
+  {application['property_area']}
 
 Create a personalized plan using EXACTLY these sections:
 
@@ -444,18 +513,43 @@ def generate_ai_insights(
 
     client = get_groq_client()
 
-    if client is None:
+    # --------------------------------------------------------
+    # Check package
+    # --------------------------------------------------------
+
+    if not GROQ_PACKAGE_AVAILABLE:
+
         return (
             None,
-            "Groq is not configured. Add GROQ_API_KEY "
-            "to your environment or Streamlit secrets."
+            "Groq package is not installed. "
+            "Add 'groq' to requirements.txt and redeploy."
         )
+
+    # --------------------------------------------------------
+    # Check client
+    # --------------------------------------------------------
+
+    if client is None:
+
+        return (
+            None,
+            "GROQ_API_KEY is not available. "
+            "Add GROQ_API_KEY to Streamlit Cloud Secrets."
+        )
+
+    # --------------------------------------------------------
+    # Build prompt
+    # --------------------------------------------------------
 
     prompt = build_ai_prompt(
         application,
         probability,
         prediction
     )
+
+    # --------------------------------------------------------
+    # API request
+    # --------------------------------------------------------
 
     try:
 
@@ -468,12 +562,11 @@ def generate_ai_insights(
                     "role": "system",
                     "content": (
                         "You provide grounded financial guidance "
-                        "for a loan application demo. "
+                        "for a loan application demonstration. "
                         "Be concise, transparent, and never "
                         "invent missing financial facts."
                     )
                 },
-
                 {
                     "role": "user",
                     "content": prompt
@@ -485,10 +578,14 @@ def generate_ai_insights(
             max_tokens=1400
         )
 
-        return (
-            completion.choices[0].message.content,
-            None
+        answer = (
+            completion
+            .choices[0]
+            .message
+            .content
         )
+
+        return answer, None
 
     except Exception as e:
 
@@ -499,7 +596,7 @@ def generate_ai_insights(
 
 
 # ============================================================
-# LOAD MODEL
+# LOAD / TRAIN MODEL
 # ============================================================
 
 try:
@@ -508,16 +605,17 @@ try:
 
     model_ready = True
 
+    model_error = None
+
 except Exception as e:
 
     model_ready = False
 
-    st.error(
-        "Could not load 07_loan_train.xls. "
-        "Keep it in the same folder as app.py."
-    )
+    model_error = str(e)
 
-    st.exception(e)
+    model = None
+    accuracy = None
+    auc = None
 
 
 # ============================================================
@@ -528,6 +626,7 @@ st.markdown(
     """
     <div class="hero">
         <h1>🏦 Loan Approval Predictor</h1>
+
         <p>
             Credit Assessment •
             Machine Learning Insights •
@@ -548,6 +647,23 @@ st.info(
     "The ML model and AI assistant are not a real lending "
     "decision engine."
 )
+
+
+# ============================================================
+# MODEL ERROR
+# ============================================================
+
+if not model_ready:
+
+    st.error(
+        "The ML model could not be loaded."
+    )
+
+    st.code(
+        model_error
+        if model_error
+        else "Unknown model error."
+    )
 
 
 # ============================================================
@@ -583,7 +699,9 @@ with apply_tab:
     # Step 1
     # --------------------------------------------------------
 
-    st.markdown("#### Step 1 · Loan & income")
+    st.markdown(
+        "#### Step 1 · Loan & income"
+    )
 
     c1, c2 = st.columns(2)
 
@@ -622,7 +740,9 @@ with apply_tab:
     # Step 2
     # --------------------------------------------------------
 
-    st.markdown("#### Step 2 · Profile")
+    st.markdown(
+        "#### Step 2 · Profile"
+    )
 
     c1, c2 = st.columns(2)
 
@@ -653,7 +773,7 @@ with apply_tab:
     st.markdown("")
 
     # --------------------------------------------------------
-    # Assessment Button
+    # Assessment button
     # --------------------------------------------------------
 
     if st.button(
@@ -666,23 +786,27 @@ with apply_tab:
 
             st.error(
                 "The model is not available. "
-                "Please fix the dataset/model loading issue first."
+                "Please fix the model/dataset issue first."
             )
 
         else:
 
             # ------------------------------------------------
-            # Convert customer inputs into dataset format
+            # Convert customer inputs to dataset format
             # ------------------------------------------------
 
             annual_income = monthly_income * 12
 
-            annual_coapp_income = monthly_coapp_income * 12
+            annual_coapp_income = (
+                monthly_coapp_income * 12
+            )
 
-            loan_amount_dataset = requested_loan / 1000
+            loan_amount_dataset = (
+                requested_loan / 1000
+            )
 
             # ------------------------------------------------
-            # Create model input
+            # Model input
             # ------------------------------------------------
 
             row = pd.DataFrame(
@@ -705,7 +829,7 @@ with apply_tab:
             )
 
             # ------------------------------------------------
-            # Model prediction
+            # Prediction
             # ------------------------------------------------
 
             probability = float(
@@ -717,35 +841,42 @@ with apply_tab:
             )
 
             # ------------------------------------------------
-            # Application object for AI
+            # Application object
             # ------------------------------------------------
 
             application = {
 
-                "monthly_income": monthly_income,
+                "monthly_income":
+                    monthly_income,
 
-                "monthly_coapp_income": monthly_coapp_income,
+                "monthly_coapp_income":
+                    monthly_coapp_income,
 
-                "total_monthly": (
+                "total_monthly":
                     monthly_income +
-                    monthly_coapp_income
-                ),
+                    monthly_coapp_income,
 
-                "requested_loan": requested_loan,
+                "requested_loan":
+                    requested_loan,
 
-                "term": term,
+                "term":
+                    term,
 
-                "dependents": dependents,
+                "dependents":
+                    dependents,
 
-                "education": education,
+                "education":
+                    education,
 
-                "employment": employment,
+                "employment":
+                    employment,
 
-                "property_area": property_area
+                "property_area":
+                    property_area
             }
 
             # ------------------------------------------------
-            # Save to session
+            # Save session
             # ------------------------------------------------
 
             st.session_state["row"] = row
@@ -755,8 +886,6 @@ with apply_tab:
             st.session_state["prediction"] = prediction
 
             st.session_state["application"] = application
-
-            # Clear previous AI response
 
             st.session_state.pop(
                 "ai_insights",
@@ -812,7 +941,9 @@ with apply_tab:
 
 with assessment_tab:
 
-    st.markdown("### 📊 Application Assessment")
+    st.markdown(
+        "### 📊 Application Assessment"
+    )
 
     if "prediction" not in st.session_state:
 
@@ -823,11 +954,17 @@ with assessment_tab:
 
     else:
 
-        probability = st.session_state["probability"]
+        probability = (
+            st.session_state["probability"]
+        )
 
-        prediction = st.session_state["prediction"]
+        prediction = (
+            st.session_state["prediction"]
+        )
 
-        application = st.session_state["application"]
+        application = (
+            st.session_state["application"]
+        )
 
         # ----------------------------------------------------
         # Metrics
@@ -876,28 +1013,17 @@ with assessment_tab:
         )
 
         # ----------------------------------------------------
-        # Application Summary
+        # Application summary
         # ----------------------------------------------------
 
         st.markdown(
             "#### Application summary"
         )
 
-        row = st.session_state["row"].copy()
-
-        # Convert backend values back to customer-friendly units
-
-        row["ApplicantIncome"] *= 1
-
-        row["CoapplicantIncome"] *= 1
-
-        row["LoanAmount"] *= 1000
-
-        # ----------------------------------------------------
-        # IMPORTANT FIX:
-        # Convert all values to strings to prevent PyArrow
-        # mixed-type DataFrame serialization errors.
-        # ----------------------------------------------------
+        row = (
+            st.session_state["row"]
+            .copy()
+        )
 
         display_row = row.T.astype(str)
 
@@ -924,7 +1050,7 @@ with ai_tab:
     )
 
     # --------------------------------------------------------
-    # No application yet
+    # No application
     # --------------------------------------------------------
 
     if "prediction" not in st.session_state:
@@ -936,11 +1062,17 @@ with ai_tab:
 
     else:
 
-        application = st.session_state["application"]
+        application = (
+            st.session_state["application"]
+        )
 
-        probability = st.session_state["probability"]
+        probability = (
+            st.session_state["probability"]
+        )
 
-        prediction = st.session_state["prediction"]
+        prediction = (
+            st.session_state["prediction"]
+        )
 
         # ----------------------------------------------------
         # Metrics
@@ -968,27 +1100,41 @@ with ai_tab:
         )
 
         # ----------------------------------------------------
-        # Groq connection check
+        # Connection check
         # ----------------------------------------------------
 
-        if get_groq_client() is None:
+        client = get_groq_client()
+
+        if not GROQ_PACKAGE_AVAILABLE:
 
             st.warning(
-                "AI is not connected yet. "
-                "Configure your GROQ_API_KEY to enable "
-                "personalized insights."
+                "The Groq Python package is not installed."
             )
 
             st.code(
-                'Windows PowerShell:\n'
-                '$env:GROQ_API_KEY="gsk_your_new_key_here"\n\n'
-                'Then restart Streamlit.\n\n'
-                'For deployment, use Streamlit Secrets '
-                'instead of hardcoding the key.',
+                "Add this to requirements.txt:\n\n"
+                "groq"
+            )
+
+        elif client is None:
+
+            st.warning(
+                "AI is not connected yet. "
+                "Configure your GROQ_API_KEY in "
+                "Streamlit Cloud Secrets."
+            )
+
+            st.code(
+                'Streamlit Secrets:\n\n'
+                'GROQ_API_KEY = "gsk_your_new_key_here"',
                 language="text"
             )
 
         else:
+
+            st.success(
+                "✅ Groq AI is connected."
+            )
 
             # ------------------------------------------------
             # Generate AI plan
@@ -1004,10 +1150,12 @@ with ai_tab:
                     "Generating personalized insights with Groq..."
                 ):
 
-                    answer, error = generate_ai_insights(
-                        application,
-                        probability,
-                        prediction
+                    answer, error = (
+                        generate_ai_insights(
+                            application,
+                            probability,
+                            prediction
+                        )
                     )
 
                 if error:
@@ -1059,7 +1207,7 @@ with ai_tab:
                 )
 
                 # ------------------------------------------------
-                # Follow-up questions
+                # Follow-up
                 # ------------------------------------------------
 
                 st.markdown(
@@ -1110,33 +1258,36 @@ Rules:
 
                     try:
 
-                        completion = client.chat.completions.create(
-
-                            model=GROQ_MODEL,
-
-                            messages=[
-                                {
-                                    "role": "system",
-                                    "content": (
-                                        "You are a grounded financial "
-                                        "guidance assistant. Answer "
-                                        "only from the supplied "
-                                        "application context. "
-                                        "Do not invent credit data "
-                                        "or make final lending "
-                                        "decisions."
-                                    )
-                                },
-
-                                {
-                                    "role": "user",
-                                    "content": follow_up_prompt
-                                }
-                            ],
-
-                            temperature=0.25,
-
-                            max_tokens=900
+                        completion = (
+                            client
+                            .chat
+                            .completions
+                            .create(
+                                model=GROQ_MODEL,
+                                messages=[
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "You are a grounded "
+                                            "financial guidance "
+                                            "assistant. Answer only "
+                                            "from the supplied "
+                                            "application context. "
+                                            "Do not invent credit "
+                                            "data or make final "
+                                            "lending decisions."
+                                        )
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            follow_up_prompt
+                                        )
+                                    }
+                                ],
+                                temperature=0.25,
+                                max_tokens=900
+                            )
                         )
 
                         answer = (
@@ -1238,9 +1389,10 @@ with insights_tab:
             }
         )
 
-        # Convert everything to string for robust Arrow display
-
-        model_table = model_table.astype(str)
+        model_table = (
+            model_table
+            .astype(str)
+        )
 
         st.dataframe(
             model_table,
@@ -1273,7 +1425,10 @@ with insights_tab:
             }
         )
 
-        feature_table = feature_table.astype(str)
+        feature_table = (
+            feature_table
+            .astype(str)
+        )
 
         st.dataframe(
             feature_table,
@@ -1282,7 +1437,7 @@ with insights_tab:
         )
 
         # ----------------------------------------------------
-        # Important limitation
+        # Limitation
         # ----------------------------------------------------
 
         st.warning(
