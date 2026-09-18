@@ -5,3 +5,4 @@ scikit-learn
 xgboost
 joblib
 xlrd>=2.0.1
+groq
